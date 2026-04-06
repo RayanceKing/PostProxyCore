@@ -21,13 +21,20 @@ let package = Package(
     dependencies: [
         .package(url: "https://github.com/swift-server/async-http-client.git", from: "1.24.0"),
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.72.0"),
+        .package(url: "https://github.com/apple/swift-nio-http2.git", from: "1.42.0"),
         .package(url: "https://github.com/apple/swift-nio-ssl.git", from: "2.28.0"),
         .package(url: "https://github.com/apple/swift-certificates.git", from: "1.7.0"),
         .package(url: "https://github.com/apple/swift-crypto.git", from: "3.8.0")
     ],
     targets: [
         .target(name: "Protocol"),
-        .target(name: "Storage", dependencies: ["Protocol"]),
+        .target(
+            name: "Storage",
+            dependencies: ["Protocol"],
+            linkerSettings: [
+                .linkedLibrary("sqlite3")
+            ]
+        ),
         .target(
             name: "CoreSecurity",
             dependencies: [
@@ -50,9 +57,14 @@ let package = Package(
             dependencies: [
                 "Protocol",
                 "CoreSecurity",
+                "Storage",
+                "HTTPClient",
                 .product(name: "NIOCore", package: "swift-nio"),
                 .product(name: "NIOPosix", package: "swift-nio"),
                 .product(name: "NIOHTTP1", package: "swift-nio"),
+                .product(name: "NIOTLS", package: "swift-nio"),
+                .product(name: "NIOWebSocket", package: "swift-nio"),
+                .product(name: "NIOHTTP2", package: "swift-nio-http2"),
                 .product(name: "NIOSSL", package: "swift-nio-ssl")
             ]
         ),
@@ -64,7 +76,10 @@ let package = Package(
         .testTarget(name: "HTTPClientTests", dependencies: ["HTTPClient", "Protocol"]),
         .testTarget(name: "CoreSecurityTests", dependencies: ["CoreSecurity"]),
         .testTarget(name: "StorageTests", dependencies: ["Storage", "Protocol"]),
-        .testTarget(name: "ProxyCoreTests", dependencies: ["ProxyCore", "Protocol"])
+        .testTarget(
+            name: "ProxyCoreTests",
+            dependencies: ["ProxyCore", "Protocol", "Storage", "HTTPClient"]
+        )
     ],
     swiftLanguageModes: [.v6]
 )

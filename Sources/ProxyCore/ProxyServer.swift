@@ -4,6 +4,7 @@ import CoreSecurity
 @preconcurrency import NIOHTTP1
 @preconcurrency import NIOPosix
 import Protocol
+import Storage
 
 public enum ProxyMode: Sendable {
     case passthrough
@@ -74,6 +75,8 @@ public struct NoopMITMOrchestrator: MITMOrchestrating {
 public final class ProxyServer {
     private let configuration: ProxyServerConfiguration
     private let sessionRegistry: ProxySessionRegistry
+    private let historyStore: any HistoryStore
+    private let rewriteEngine: RewriteEngine
     private let mitmOrchestrator: any MITMOrchestrating
     private let group: MultiThreadedEventLoopGroup
     private let ownsGroup: Bool
@@ -82,13 +85,23 @@ public final class ProxyServer {
     public init(
         configuration: ProxyServerConfiguration,
         sessionRegistry: ProxySessionRegistry = ProxySessionRegistry(),
+        historyStore: any HistoryStore = InMemoryHistoryStore(),
+        rewriteEngine: RewriteEngine = RewriteEngine(),
         mitmOrchestrator: (any MITMOrchestrating)? = nil,
         eventLoopGroup: MultiThreadedEventLoopGroup? = nil
     ) {
         self.configuration = configuration
         self.sessionRegistry = sessionRegistry
+        self.historyStore = historyStore
+        self.rewriteEngine = rewriteEngine
         self.mitmOrchestrator = mitmOrchestrator
-            ?? DefaultMITMOrchestrator(upstreamTLSVerification: configuration.upstreamTLSVerification)
+            ?? DefaultMITMOrchestrator(
+                certificateProvider: InMemoryCertificateManager(),
+                upstreamTLSVerification: configuration.upstreamTLSVerification,
+                sessionRegistry: sessionRegistry,
+                historyStore: historyStore,
+                rewriteEngine: rewriteEngine
+            )
         if let eventLoopGroup {
             self.group = eventLoopGroup
             self.ownsGroup = false
@@ -155,6 +168,22 @@ public final class ProxyServer {
                 }
             }
         }
+    }
+
+    public func listRewriteRules() -> [RewriteRule] {
+        rewriteEngine.listRules()
+    }
+
+    public func setRewriteRules(_ rules: [RewriteRule]) {
+        rewriteEngine.setRules(rules)
+    }
+
+    public func addRewriteRule(_ rule: RewriteRule) {
+        rewriteEngine.addRule(rule)
+    }
+
+    public func clearRewriteRules() {
+        rewriteEngine.clearRules()
     }
 }
 
