@@ -109,13 +109,16 @@ public final class ProxyServer {
             .serverChannelOption(ChannelOptions.backlog, value: 256)
             .serverChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
             .childChannelInitializer { [configuration, sessionRegistry, mitmOrchestrator] channel in
-                channel.pipeline.addHandler(
-                    ByteToMessageHandler(HTTPRequestDecoder(leftOverBytesStrategy: .forwardBytes)),
-                    name: HTTPPipelineNames.requestDecoder
-                ).flatMap {
-                    channel.pipeline.addHandler(HTTPResponseEncoder(), name: HTTPPipelineNames.responseEncoder)
-                }.flatMap {
-                    channel.pipeline.addHandler(
+                do {
+                    try channel.pipeline.syncOperations.addHandler(
+                        ByteToMessageHandler(HTTPRequestDecoder(leftOverBytesStrategy: .forwardBytes)),
+                        name: HTTPPipelineNames.requestDecoder
+                    )
+                    try channel.pipeline.syncOperations.addHandler(
+                        HTTPResponseEncoder(),
+                        name: HTTPPipelineNames.responseEncoder
+                    )
+                    try channel.pipeline.syncOperations.addHandler(
                         ConnectProxyHandler(
                             configuration: configuration,
                             sessionRegistry: sessionRegistry,
@@ -123,6 +126,9 @@ public final class ProxyServer {
                         ),
                         name: HTTPPipelineNames.connectHandler
                     )
+                    return channel.eventLoop.makeSucceededFuture(())
+                } catch {
+                    return channel.eventLoop.makeFailedFuture(error)
                 }
             }
             .childChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
@@ -158,7 +164,7 @@ private enum HTTPPipelineNames {
     static let connectHandler = "proxy.connect.handler"
 }
 
-private final class ConnectProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
+private final class ConnectProxyHandler: ChannelInboundHandler, RemovableChannelHandler, @unchecked Sendable {
     typealias InboundIn = HTTPServerRequestPart
     typealias OutboundOut = HTTPServerResponsePart
 
@@ -198,6 +204,7 @@ private final class ConnectProxyHandler: ChannelInboundHandler, RemovableChannel
         context.fireChannelInactive()
     }
 
+    // swiftlint:disable:next sendable_concurrency
     private func handleHead(_ head: HTTPRequestHead, context: ChannelHandlerContext) {
         guard head.method == .CONNECT else {
             respondAndClose(
@@ -226,13 +233,14 @@ private final class ConnectProxyHandler: ChannelInboundHandler, RemovableChannel
         case .passthrough:
             establishTunnel(to: connectTarget, context: context)
         case .mitm:
-            sendConnectionEstablished(context: context)
+            let channel = context.channel
+            sendConnectionEstablished(channel: channel)
                 .flatMap {
-                    self.switchToMITM(context: context, target: connectTarget)
+                    self.switchToMITM(channel: channel, target: connectTarget)
                 }
                 .whenFailure { _ in
                     self.respondAndClose(
-                        context: context,
+                        channel: channel,
                         status: .badGateway,
                         reason: "MITM setup failed"
                     )
@@ -240,69 +248,75 @@ private final class ConnectProxyHandler: ChannelInboundHandler, RemovableChannel
         }
     }
 
+    // swiftlint:disable:next sendable_concurrency
     private func establishTunnel(to target: ConnectTarget, context: ChannelHandlerContext) {
+        let inboundChannel = context.channel
         let outboundBootstrap = ClientBootstrap(group: context.eventLoop)
 
         outboundBootstrap.connect(host: target.host, port: target.port).flatMap { outboundChannel in
             self.targetChannel = outboundChannel
 
-            return outboundChannel.pipeline.addHandler(TunnelRelayHandler(peer: context.channel)).flatMap {
-                self.sendConnectionEstablished(context: context)
+            return outboundChannel.pipeline.addHandler(TunnelRelayHandler(peer: inboundChannel)).flatMap {
+                self.sendConnectionEstablished(channel: inboundChannel)
             }.flatMap {
-                self.switchToRawTunnel(context: context, outboundChannel: outboundChannel)
+                self.switchToRawTunnel(channel: inboundChannel, outboundChannel: outboundChannel)
             }
         }.whenFailure { _ in
-            self.respondAndClose(context: context, status: .badGateway, reason: "Failed to connect upstream")
+            self.respondAndClose(channel: inboundChannel, status: .badGateway, reason: "Failed to connect upstream")
         }
     }
 
     private func sendConnectionEstablished(context: ChannelHandlerContext) -> EventLoopFuture<Void> {
+        sendConnectionEstablished(channel: context.channel)
+    }
+
+    private func sendConnectionEstablished(channel: Channel) -> EventLoopFuture<Void> {
         let head = HTTPResponseHead(version: .http1_1, status: .ok)
-        let promise = context.eventLoop.makePromise(of: Void.self)
-        context.write(wrapOutboundOut(.head(head)), promise: nil)
-        context.writeAndFlush(wrapOutboundOut(.end(nil)), promise: promise)
+        let promise = channel.eventLoop.makePromise(of: Void.self)
+        channel.write(HTTPServerResponsePart.head(head), promise: nil)
+        channel.writeAndFlush(HTTPServerResponsePart.end(nil), promise: promise)
         return promise.futureResult
     }
 
-    private func switchToMITM(
-        context: ChannelHandlerContext,
-        target: ConnectTarget
-    ) -> EventLoopFuture<Void> {
-        context.pipeline.removeHandler(name: HTTPPipelineNames.requestDecoder).flatMap {
-            context.pipeline.removeHandler(name: HTTPPipelineNames.responseEncoder)
+    // swiftlint:disable:next sendable_concurrency
+    private func switchToMITM(channel: Channel, target: ConnectTarget) -> EventLoopFuture<Void> {
+        let pipeline = channel.pipeline
+        return pipeline.removeHandler(name: HTTPPipelineNames.requestDecoder).flatMap {
+            pipeline.removeHandler(name: HTTPPipelineNames.responseEncoder)
         }.flatMap {
-            context.pipeline.removeHandler(self)
+            pipeline.removeHandler(self)
         }.flatMap {
-            self.mitmOrchestrator.startMITM(inboundChannel: context.channel, target: target)
+            self.mitmOrchestrator.startMITM(inboundChannel: channel, target: target)
         }
     }
 
-    private func switchToRawTunnel(
-        context: ChannelHandlerContext,
-        outboundChannel: Channel
-    ) -> EventLoopFuture<Void> {
-        context.pipeline.removeHandler(name: HTTPPipelineNames.requestDecoder).flatMap {
-            context.pipeline.removeHandler(name: HTTPPipelineNames.responseEncoder)
+    private func switchToRawTunnel(channel: Channel, outboundChannel: Channel) -> EventLoopFuture<Void> {
+        let pipeline = channel.pipeline
+        return pipeline.removeHandler(name: HTTPPipelineNames.requestDecoder).flatMap {
+            pipeline.removeHandler(name: HTTPPipelineNames.responseEncoder)
         }.flatMap {
-            context.pipeline.addHandler(TunnelRelayHandler(peer: outboundChannel))
+            pipeline.addHandler(TunnelRelayHandler(peer: outboundChannel))
         }.flatMap {
-            context.pipeline.removeHandler(self)
+            pipeline.removeHandler(self)
         }
     }
 
     private func respondAndClose(context: ChannelHandlerContext, status: HTTPResponseStatus, reason: String) {
+        respondAndClose(channel: context.channel, status: status, reason: reason)
+    }
+
+    private func respondAndClose(channel: Channel, status: HTTPResponseStatus, reason: String) {
         var headers = HTTPHeaders()
         headers.add(name: "Content-Type", value: "text/plain; charset=utf-8")
         let body = ByteBuffer(string: reason)
         headers.add(name: "Content-Length", value: "\(body.readableBytes)")
 
         let head = HTTPResponseHead(version: .http1_1, status: status, headers: headers)
-        context.write(wrapOutboundOut(.head(head)), promise: nil)
-        context.write(wrapOutboundOut(.body(.byteBuffer(body))), promise: nil)
-        context.writeAndFlush(wrapOutboundOut(.end(nil))).whenComplete { _ in
-            context.close(promise: nil)
-        }
+        channel.write(HTTPServerResponsePart.head(head), promise: nil)
+        channel.write(HTTPServerResponsePart.body(.byteBuffer(body)), promise: nil)
+        channel.writeAndFlush(HTTPServerResponsePart.end(nil), promise: nil)
+        channel.close(promise: nil)
     }
 }
 
-extension ConnectProxyHandler: @unchecked Sendable {}
+// 已在类声明处添加 @unchecked Sendable，无需重复扩展

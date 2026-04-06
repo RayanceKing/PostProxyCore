@@ -233,9 +233,17 @@ public actor InMemoryCertificateManager: CertificateManaging, MITMCertificatePro
     }
 
     private static func defaultStorageDirectory() -> URL {
-        FileManager.default.homeDirectoryForCurrentUser
+        #if os(macOS) || os(Linux)
+        return FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".postproxycore")
             .appendingPathComponent("certificates")
+        #else
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        return base
+            .appendingPathComponent("PostProxyCore")
+            .appendingPathComponent("certificates")
+        #endif
     }
 }
 

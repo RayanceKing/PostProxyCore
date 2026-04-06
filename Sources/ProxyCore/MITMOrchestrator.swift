@@ -57,7 +57,7 @@ public final class DefaultMITMOrchestrator: MITMOrchestrating {
     }
 }
 
-private final class MITMHTTPHandler: ChannelInboundHandler {
+private final class MITMHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
     typealias InboundIn = HTTPServerRequestPart
     typealias OutboundOut = HTTPServerResponsePart
 
@@ -94,6 +94,7 @@ private final class MITMHTTPHandler: ChannelInboundHandler {
         context.close(promise: nil)
     }
 
+    // swiftlint:disable:next sendable_concurrency
     private func forwardCurrentRequest(context: ChannelHandlerContext) {
         guard let inboundHead = currentHead else {
             respond502(context: context, message: "Missing HTTP request head")
@@ -122,15 +123,13 @@ private final class MITMHTTPHandler: ChannelInboundHandler {
                 let sslContext = try NIOSSLContext(configuration: clientTLS)
                 let sslHandler = try NIOSSLClientHandler(context: sslContext, serverHostname: target.host)
 
-                return channel.pipeline.addHandler(sslHandler).flatMap {
-                    channel.pipeline.addHandler(HTTPRequestEncoder())
-                }.flatMap {
-                    channel.pipeline.addHandler(
-                        ByteToMessageHandler(HTTPResponseDecoder(leftOverBytesStrategy: .forwardBytes))
-                    )
-                }.flatMap {
-                    channel.pipeline.addHandler(OutboundResponseCollector(promise: responsePromise))
-                }
+                try channel.pipeline.syncOperations.addHandler(sslHandler)
+                try channel.pipeline.syncOperations.addHandler(HTTPRequestEncoder())
+                try channel.pipeline.syncOperations.addHandler(
+                    ByteToMessageHandler(HTTPResponseDecoder(leftOverBytesStrategy: .forwardBytes))
+                )
+                try channel.pipeline.syncOperations.addHandler(OutboundResponseCollector(promise: responsePromise))
+                return channel.eventLoop.makeSucceededFuture(())
             } catch {
                 return channel.eventLoop.makeFailedFuture(error)
             }
@@ -151,34 +150,39 @@ private final class MITMHTTPHandler: ChannelInboundHandler {
             responsePromise.fail(error)
         }
 
+        let inboundChannel = context.channel
         responsePromise.futureResult.whenSuccess { response in
             let responseHead = HTTPResponseHead(
                 version: response.head.version,
                 status: response.head.status,
                 headers: response.head.headers
             )
-            context.write(self.wrapOutboundOut(.head(responseHead)), promise: nil)
+            inboundChannel.write(HTTPServerResponsePart.head(responseHead), promise: nil)
             if response.body.readableBytes > 0 {
-                context.write(self.wrapOutboundOut(.body(.byteBuffer(response.body))), promise: nil)
+                inboundChannel.write(HTTPServerResponsePart.body(.byteBuffer(response.body)), promise: nil)
             }
-            context.writeAndFlush(self.wrapOutboundOut(.end(nil)), promise: nil)
+            inboundChannel.writeAndFlush(HTTPServerResponsePart.end(nil), promise: nil)
         }
 
         responsePromise.futureResult.whenFailure { _ in
-            self.respond502(context: context, message: "Failed to proxy TLS upstream request")
+            self.respond502(channel: inboundChannel, message: "Failed to proxy TLS upstream request")
         }
     }
 
     private func respond502(context: ChannelHandlerContext, message: String) {
+        respond502(channel: context.channel, message: message)
+    }
+
+    private func respond502(channel: Channel, message: String) {
         let body = ByteBuffer(string: message)
         var headers = HTTPHeaders()
         headers.add(name: "Content-Type", value: "text/plain; charset=utf-8")
         headers.add(name: "Content-Length", value: "\(body.readableBytes)")
 
         let head = HTTPResponseHead(version: .http1_1, status: .badGateway, headers: headers)
-        context.write(wrapOutboundOut(.head(head)), promise: nil)
-        context.write(wrapOutboundOut(.body(.byteBuffer(body))), promise: nil)
-        context.writeAndFlush(wrapOutboundOut(.end(nil)), promise: nil)
+        channel.write(HTTPServerResponsePart.head(head), promise: nil)
+        channel.write(HTTPServerResponsePart.body(.byteBuffer(body)), promise: nil)
+        channel.writeAndFlush(HTTPServerResponsePart.end(nil), promise: nil)
     }
 
     private func normalizeURI(_ rawURI: String) -> String {
@@ -196,8 +200,6 @@ private final class MITMHTTPHandler: ChannelInboundHandler {
         return path
     }
 }
-
-extension MITMHTTPHandler: @unchecked Sendable {}
 
 private struct ProxiedResponse {
     let head: HTTPResponseHead
